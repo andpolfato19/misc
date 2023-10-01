@@ -1,0 +1,861 @@
+
+
+library(SparkR)# Leveraging performance
+sparkR.session() 
+library(rstan)
+
+#svm.out  <- do.call(dplyr::bind_rows, SparkR::spark.lapply(atbs$PN[1:2],function(x){
+    #---------------------------- everything starts here -------------------------
+library(modeltime)
+library(Metrics)
+library(earth)
+library(rules)
+   
+   x <- "11417099"
+    m <- df |> dplyr::filter(PN == x) 
+    
+    #m <- m |> dplyr::rename(Date = Month)
+
+    tryCatch(seq_datas_total <- seq.Date(from=as.Date(m$Date|>min()),to=as.Date(df$Date|>max()),by="month"),
+                error = function(e) {})
+    
+     tryCatch(dataset <- dplyr::left_join(data.frame("Date"=seq_datas_total,
+                                           "PN"=rep(m$PN[1],times=length(seq_datas_total))),
+                                m,
+                                by="Date"),
+                error = function(e) {})
+    
+     tryCatch(dataset <- dataset |> 
+      dplyr::mutate(Qty=ifelse(is.na(Qty),0,Qty)) |> 
+      dplyr::select(Date,PN.x,Qty)|>
+      dplyr::rename("PN"="PN.x")|> 
+      dplyr::filter_all(function(z) !is.na(z)) |> 
+      dplyr::mutate(fy=ifelse(Qty == 0,log1p(Qty), 
+                                ifelse(Qty == 1,log1p(Qty),log1p(Qty)))),
+                error = function(e) {})
+                        
+                        
+#------------------------------ add future window --------------------------
+ tryCatch({futuretbl <- dataset |>
+      dplyr::select(Date,fy) |> 
+      dplyr::bind_rows(
+        timetk::future_frame(.data= dataset,.date_var = Date, .length_out = 6)
+        ) |>  
+      #dplyr::mutate(dt = as.factor(lubridate::month(Date))) |>  
+      timetk::tk_augment_lags(c(fy) , .lags = 6) |> 
+      ### add rolling  - better trend
+      timetk::tk_augment_slidify(
+                         .value   = c(fy_lag6),
+                         .f       = sd,
+                         .period  = c(12),
+                         .align   = "right",
+                         .names   = stringr::str_c("SD",c(6)),
+                         .partial = TRUE) |> 
+   timetk::tk_augment_slidify(
+                         .value   = c(fy_lag6),
+                         .f       = mean,
+                         .period  = c(3,12),
+                         .align   = "right",
+                         .partial = TRUE) |>
+      dplyr::mutate(dt = as.factor(lubridate::month(Date)))},
+                error = function(e) {})
+    
+ 
+              
+ #------------------------------ initial cleaning  --------------------------     
+              
+      tryCatch(dtaux <- futuretbl |> 
+        dplyr::filter(Qty != 0) |>
+        dplyr::slice(1) |> 
+        dplyr::select(Date) ,
+                error = function(e) {})
+    
+    
+    tryCatch( if(dim(dtaux)[1] != 0){
+    
+    futuretbl <- futuretbl |> 
+       dplyr::filter(Date >= dtaux[[1]])},
+                error = function(e) {})
+
+     
+     tryCatch( futuretbl_modl <- futuretbl |> 
+        dplyr::filter_all(function(z) !is.na(z)),
+                error = function(e) {})
+      
+     tryCatch( futuretbl <- futuretbl |> 
+        dplyr::filter(is.na(fy)),
+                error = function(e) {})
+              
+    #------------------------- preparar splines e séries de fourier ------------------------
+    #---------------------------------------------------------------------------------------
+      
+      
+     tryCatch({rec <- recipes::recipe(fy ~ . , data = futuretbl_modl) |> 
+           #recipes::step_bs(Qty, degree = 3) |>  
+           timetk::step_timeseries_signature(Date) |> 
+           #timetk::step_fourier(Date, period = c(12), K = 2) |> 
+           #recipes::step_dummy(dt, one_hot = TRUE) |> 
+           recipes::step_rm(matches("(mday)|(week)|(mweek)|(yday)|(am.pm)|(_year.iso)|(_minute)|
+                                    (_second)|(_hour)|(wday)|(month)|(month.xts)|(_quarter)|(PN)|
+                                    (Qty)|(Date_index.num)|(Date_year)|(Date_half)|(Date_day)|(Date_qday)|(Qty_lag)")) |> 
+        #recipes::step_rm("Date") |> 
+        recipes::step_rm("fy_lag6") |>
+        recipes::step_rm("dt") |> 
+        recipes::step_rm("Date_second")},
+                error = function(e) {})
+    
+              #rec |> recipes::prep() |> recipes::juice() |> dplyr::glimpse()
+       # começar o procedimento de modelagem
+      # ---------------------- auto arima (parte linear) - ml (parte do resíduo) ----------------------------
+
+    
+    tryCatch(mdl_fit_ar <- modeltime::arima_reg() |> 
+                                   parsnip::set_engine("auto_arima") ,
+                error = function(e) return(NULL))
+        
+       tryCatch(suppressMessages(wk_ar <- workflows::workflow() |> 
+        workflows::add_model(mdl_fit_ar) |> 
+        workflows::add_recipe(rec) |> 
+        parsnip::fit(futuretbl_modl)),
+                error = function(e) return(NULL))
+
+    
+    tryCatch({residuos <- modeltime::modeltime_table(wk_ar) |> 
+      modeltime_calibrate(new_data =  futuretbl_modl) |> 
+      modeltime_residuals()},
+                error = function(e) {})
+           
+
+    #residuos$.residuals |> forecast::checkresiduals()
+
+tryCatch({mlag <- dataset |> 
+      dplyr::arrange(Date) |> 
+      #dplyr::mutate(fy = log1p(Qty)) |> 
+      timetk::tk_augment_differences(fy, .lags = 1:3) |> 
+      dplyr::bind_rows(
+        timetk::future_frame(.data= dataset,.date_var = Date, .length_out = 6)
+        ) |> 
+      timetk::tk_augment_lags(c(fy_lag1_diff1,fy_lag2_diff1,fy_lag3_diff1) , .lags = 6) |> 
+      timetk::tk_augment_slidify(
+                         .value   = c(fy_lag3_diff1_lag6),
+                         .f       = mean,
+                         .period  = c(3),
+                         .align   = "right",
+                         .partial = TRUE) |> 
+      dplyr::select(1,11)},
+                error = function(e) {})
+              
+
+
+# ------------------ modelar os resíduos do arima ----------------------------
+# ------------------ aparentemente as diferenças são úteis -------------------
+     tryCatch({future_res <- residuos |>
+      dplyr::select(.index,.residuals,.prediction,.actual) |> 
+      dplyr::bind_rows(
+        timetk::future_frame(.data= residuos,.date_var = .index, .length_out = 6)
+        ) |>  
+      #dplyr::left_join(mlag, by = c(".index" = "Date")) |> 
+      #dplyr::mutate(dt = as.factor(lubridate::month(Date))) |> 
+      timetk::tk_augment_lags(c(.residuals,.prediction,.actual) , .lags = 6) |> 
+     # dplyr::mutate(.residuals_lag6 = .residuals_lag6^2) |> 
+      #dplyr::select(-fy,-Qty,-PN,-fy_lag1_diff1,-fy_lag2_diff1,-fy_lag3_diff1) |> 
+      ### add rolling  - better trend
+      timetk::tk_augment_slidify(
+                         .value   = c(.residuals_lag6),
+                         .f       = median,
+                         .period  = c(6),
+                         .align   = "right",
+                         .partial = TRUE) |> 
+      timetk::tk_augment_slidify(
+                         .value   = c(.actual_lag6),
+                         .f       = median,
+                         .period  = c(3,12),
+                         .names   = stringr::str_c("m_actual",c(3,12)),
+                         .align   = "right",
+                         .partial = TRUE) |> 
+      dplyr::mutate(dt = as.factor(lubridate::month(.index)))},
+                error = function(e) {})
+    
+
+    tryCatch( futuretbl_modl_res <- future_res |> 
+        dplyr::filter_all(function(z) !is.na(z)),
+                error = function(e) {})
+      
+     tryCatch( futuretbl_res <- future_res |> 
+        dplyr::filter(is.na(.residuals)),
+                error = function(e) {})
+              
+      tryCatch({mt      <- rsample::initial_time_split(futuretbl_modl_res, prop = 0.9)
+                m_train <- rsample::training(mt)
+                m_test  <- rsample::testing(mt)},
+                error = function(e) {})
+      
+    
+    tryCatch({rec_res <- recipes::recipe(.residuals ~ . , data = m_train) |> 
+           #recipes::step_bs(Qty, degree = 3) |>  
+           timetk::step_timeseries_signature(.index) |> 
+           timetk::step_fourier(.index, period = c(12), K = 1) |> 
+           #recipes::step_dummy(dt, one_hot = TRUE) |> 
+           recipes::step_rm(matches("(.index_index.num)|(.index_month)|(.index_year)|(.index_year.iso)|
+                                    (.index_half)|(.index_day)|(.index_hour)|(.index_wday)|
+                                    (.index_mweek)|(.index_week)|(.index_week.iso)|(.index_quarter)|
+                                    (.index_half)|(.index_minute)|(.index_second)|(.index_am.pm)|
+                                    (.index_mday)|(.index_qday)|(.index_yday)|(.index_mweek)|
+                                    (.index_mday7)|(.index_half)")) |> 
+        recipes::step_rm(".index") |> 
+        recipes::step_rm(".index_mday") |> 
+        recipes::step_rm(".index_mday7") |> 
+        recipes::step_rm(".residuals_lag6") |> 
+        recipes::step_rm(".prediction_lag6") |> 
+        recipes::step_rm(".prediction") |> 
+        recipes::step_rm(".actual") |>
+        recipes::step_rm(".actual_lag6") |>
+        recipes::step_rm("dt")  
+        #recipes::step_normalize(recipes::all_numeric_predictors())
+           },
+                error = function(e) {})
+    
+    # if u want to check the recipe, use the formula below
+    #rec_res |> recipes::prep() |> recipes::juice() |> dplyr::glimpse()
+    ## ---------------------- models ----------------------------
+      
+      # -- SVM,Cubist,Rf,MARS,GLMNet
+    
+    tryCatch(
+      mdl_fit_svm <- parsnip::svm_rbf(
+        mode = "regression",
+        cost = 1,
+        rbf_sigma = 1,
+        margin = 1
+      ) |> 
+        parsnip::set_engine("kernlab"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_glmnet3 <- parsnip::linear_reg(
+        mode = "regression",
+        penalty = 0.1,
+        mixture = 0.5
+      ) |>
+        parsnip::set_engine("glmnet"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_cb <- parsnip::cubist_rules(
+        mode = "regression",
+        committees = 20,
+        neighbors = 5,
+        max_rules = 15
+      ) |> 
+        parsnip::set_engine("Cubist"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_earth <- parsnip::mars(
+        mode = "regression",
+        num_terms = 10
+      ) |> 
+        parsnip::set_engine("earth", endspan = 3),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_rf <- parsnip::rand_forest(
+        mode = "regression",
+        mtry = 4,
+        trees = 100,
+        min_n = 2
+      ) |> 
+        parsnip::set_engine("randomForest"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      wk_rf <- workflows::workflow() |> 
+        workflows::add_model(mdl_fit_rf) |> 
+        workflows::add_recipe(rec_res) |> 
+        parsnip::fit(m_train),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      wk_earth <- workflows::workflow() |> 
+        workflows::add_model(mdl_fit_earth) |> 
+        workflows::add_recipe(rec_res) |> 
+        parsnip::fit(m_train),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      wk_cubist <- workflows::workflow() |> 
+        workflows::add_model(mdl_fit_cb) |> 
+        workflows::add_recipe(rec_res) |> 
+        parsnip::fit(m_train),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      wk_svm <- workflows::workflow() |> 
+        workflows::add_model(mdl_fit_svm) |> 
+        workflows::add_recipe(rec_res) |> 
+        parsnip::fit(m_train),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      wk_glmnet3 <- workflows::workflow() |> 
+        workflows::add_model(mdl_fit_glmnet3) |> 
+        workflows::add_recipe(rec_res) |> 
+        parsnip::fit(m_train),
+      error = function(e) return(NULL)
+    )
+
+             
+    #--------------- tunning ------------------------------------------------
+    
+    
+      tryCatch( resamples_1 <- rsample::vfold_cv(m_train,
+               v = 10 ,
+               ) ,
+                error = function(e) return(NULL))
+    
+    
+    #resamples_1 |> 
+     # timetk::tk_time_series_cv_plan() |> 
+      #timetk::plot_time_series_cv_plan(Date,Qty, .facet_ncol = 2)
+    
+    ## Tunagem de modelos - SVM, GLMNET, Cubist, MARS & RF
+    ## SET_ENGINE = modelo
+               
+    tryCatch(
+      mdl_fit_boost <- parsnip::svm_rbf(
+        "regression",
+        cost = e1071::tune(id = "cost"),
+        rbf_sigma = e1071::tune(id = "rbf_sigma"),
+        margin = 1
+      ) |>
+        parsnip::set_engine("kernlab"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_boost_glm <- parsnip::linear_reg(
+        "regression",
+        penalty = e1071::tune(id = "penalty"),
+        mixture = e1071::tune(id = "mixture")
+      ) |>
+        parsnip::set_engine("glmnet"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_boost_cubist <- parsnip::cubist_rules(
+        "regression",
+        committees = e1071::tune(id = "committees"),
+        neighbors = e1071::tune(id = "neighbors"),
+        max_rules = e1071::tune(id = "max_rules")
+      ) |>
+        parsnip::set_engine("Cubist"),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_boost_mars <- parsnip::mars(
+        "regression",
+        num_terms = e1071::tune(id = "num_terms")
+      ) |>
+        parsnip::set_engine("earth", endspan = 3),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl_fit_boost_rf <- parsnip::rand_forest(
+        "regression",
+        mtry = e1071::tune(),
+        trees = e1071::tune(),
+        min_n = e1071::tune()
+      ) |>
+        parsnip::set_engine("randomForest"),
+      error = function(e) return(NULL)
+    )
+
+
+      
+# ---------------- grid spec --------------------------------------------
+    
+    tryCatch(
+      mdl2 <- dials::grid_latin_hypercube(
+        hardhat::extract_parameter_set_dials(mdl_fit_boost) |>
+          recipes::update(
+            cost = dials::cost(range = c(-2, 5), scales::log10_trans()),
+            rbf_sigma = dials::rbf_sigma(range = c(-2, 5), scales::log10_trans())
+          ),
+        size = 100
+      ),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdlglm <- dials::grid_latin_hypercube(
+        hardhat::extract_parameter_set_dials(mdl_fit_boost_glm) |>
+          recipes::update(
+            penalty = dials::penalty(c(-1, -0.45), trans = scales::log10_trans()),
+            mixture = dials::mixture(range = c(0.35, 0.65))
+          ),
+        size = 100
+      ),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl2_cubist <- dials::grid_latin_hypercube(
+        hardhat::extract_parameter_set_dials(mdl_fit_boost_cubist) |>
+          recipes::update(
+            committees = rules::committees(range = c(1, 100)),
+            max_rules = rules::max_rules(range = c(1, 200))
+          ),
+        size = 100
+      ),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl2_mars <- dials::grid_latin_hypercube(
+        hardhat::extract_parameter_set_dials(mdl_fit_boost_mars) |>
+          recipes::update(
+            num_terms = dials::num_terms(range = c(1, 30))
+          ),
+        size = 30
+      ),
+      error = function(e) return(NULL)
+    )
+    
+    tryCatch(
+      mdl2_rf <- dials::grid_latin_hypercube(
+        hardhat::extract_parameter_set_dials(mdl_fit_boost_rf) |>
+          recipes::update(
+            mtry = dials::mtry(range = c(1, 5)),
+            trees = dials::trees(range = c(10, 500))
+          ),
+        size = 100
+      ),
+      error = function(e) return(NULL)
+    )
+
+               
+
+      # tune -----------------------------------------------------------------
+                                                  
+      doFuture::registerDoFuture()
+      ncores <- parallel::detectCores()
+      
+      tryCatch(future::plan(
+        
+        strategy = future::cluster,
+        workers  = parallel::makeCluster(ncores)
+        
+      ), error = function(e) return(NULL))
+    
+     
+     tryCatch(suppressMessages(tunexgg_twd <-  wk_svm |> 
+       workflows::update_model(mdl_fit_boost)|> 
+       tune::tune_grid(resamples = resamples_1,
+                 grid      = mdl2,
+                 metrics   = modeltime::default_forecast_accuracy_metric_set(),
+                 control   = tune::control_grid(verbose = FALSE,save_pred = TRUE))),
+                                 error = function(e) return(NULL))
+      
+      tryCatch(suppressMessages(tuneglmnet<-  wk_glmnet3 |> 
+       workflows::update_model(mdl_fit_boost_glm)|> 
+       tune::tune_grid(resamples = resamples_1,
+                 grid      = mdlglm,
+                 metrics   = modeltime::default_forecast_accuracy_metric_set(),
+                 control   = tune::control_grid(verbose = FALSE,save_pred = TRUE))),
+                                 error = function(e) return(NULL))
+      
+      tryCatch(suppressMessages(tunecubist <-  wk_cubist |> 
+       workflows::update_model(mdl_fit_boost_cubist)|> 
+       tune::tune_grid(resamples = resamples_1,
+                 grid      = mdl2_cubist,
+                 metrics   = modeltime::default_forecast_accuracy_metric_set(),
+                 control   = tune::control_grid(verbose = FALSE,save_pred = TRUE))),
+                                 error = function(e) return(NULL))
+      
+       tryCatch(suppressMessages(tuneearth <-  wk_earth |> 
+       workflows::update_model(mdl_fit_boost_mars)|> 
+       tune::tune_grid(resamples = resamples_1,
+                 grid      = mdl2_mars,
+                 metrics   = modeltime::default_forecast_accuracy_metric_set(),
+                 control   = tune::control_grid(verbose = FALSE,save_pred = TRUE))),
+                                 error = function(e) return(NULL))
+      
+      tryCatch(suppressMessages(tunerf <-  wk_rf |> 
+       workflows::update_model(mdl_fit_boost_rf)|> 
+       tune::tune_grid(resamples = resamples_1,
+                 grid      = mdl2_rf,
+                 metrics   = modeltime::default_forecast_accuracy_metric_set(),
+                 control   = tune::control_grid(verbose = FALSE,save_pred = TRUE))),
+                                 error = function(e) return(NULL))
+              
+   tryCatch(suppressMessages(params_rf <- tunerf |> 
+      tune::show_best(metric = "rmse" , n = Inf) |> 
+      dplyr::slice(1)),error = function(e) return(NULL))
+              
+   tryCatch(params_mars <- tuneearth |> 
+      tune::show_best(metric = "rmse" , n = Inf) |> 
+      dplyr::slice(1),error = function(e) return(NULL))
+              
+   tryCatch(params_cubist <- tunecubist |> 
+      tune::show_best(metric = "rmse" , n = Inf) |> 
+      dplyr::slice(1),error = function(e) return(NULL))
+              
+   tryCatch(params <- tunexgg_twd |> 
+      tune::show_best(metric = "rmse" , n = Inf) |> 
+      dplyr::slice(1),error = function(e) return(NULL))
+      
+      tryCatch(paramsglm <- tuneglmnet |> 
+      tune::show_best(metric = "rmse" , n = Inf) |> 
+      dplyr::slice(1),error = function(e) return(NULL))
+      
+      
+      # ------------------------ model tunned -----------------------------------
+      
+      
+      tryCatch(
+        mdl_fit_boost <- parsnip::svm_rbf(
+          mode = "regression",
+          cost = params$cost,
+          rbf_sigma = params$rbf_sigma,
+          margin = 1
+        ) |> 
+          parsnip::set_engine("kernlab"),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        mdl_fit_boost_glm <- parsnip::linear_reg(
+          mode = "regression",
+          penalty = paramsglm$penalty,
+          mixture = paramsglm$mixture
+        ) |> 
+          parsnip::set_engine("glmnet"),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        mdl_fit_boost_cubist <- parsnip::cubist_rules(
+          mode = "regression",
+          committees = params_cubist$committees,
+          neighbors = params_cubist$neighbors,
+          max_rules = params_cubist$max_rules
+        ) |> 
+          parsnip::set_engine("Cubist"),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        mdl_fit_boost_mars <- parsnip::mars(
+          mode = "regression",
+          num_terms = params_mars$num_terms
+        ) |> 
+          parsnip::set_engine("earth", endspan = 3),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        mdl_fit_boost_rf <- parsnip::rand_forest(
+          mode = "regression",
+          mtry = params_rf$mtry,
+          min_n = params_rf$min_n,
+          trees = params_rf$trees
+        ) |> 
+          parsnip::set_engine("randomForest"),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        wk_rf <- workflows::workflow() |> 
+          workflows::add_model(mdl_fit_boost_rf) |> 
+          workflows::add_recipe(rec_res) |> 
+          parsnip::fit(m_train),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        wk_earth <- workflows::workflow() |> 
+          workflows::add_model(mdl_fit_boost_mars) |> 
+          workflows::add_recipe(rec_res) |> 
+          parsnip::fit(m_train),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        wk_cubist <- workflows::workflow() |> 
+          workflows::add_model(mdl_fit_boost_cubist) |> 
+          workflows::add_recipe(rec_res) |> 
+          parsnip::fit(m_train),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        wk_svm_res <- workflows::workflow() |> 
+          workflows::add_model(mdl_fit_boost) |> 
+          workflows::add_recipe(rec_res) |> 
+          parsnip::fit(m_train),
+        error = function(e) return(NULL)
+      )
+      
+      tryCatch(
+        wk_glmnet <- workflows::workflow() |> 
+          workflows::add_model(mdl_fit_boost_glm) |> 
+          workflows::add_recipe(rec_res) |> 
+          parsnip::fit(m_train),
+        error = function(e) return(NULL)
+      )
+      
+      
+      # ---------------------- teste nos resíduos arima / juntar o predito dos resíduos com o arima 
+      tryCatch(xxx <-  modeltime::modeltime_table(wk_svm_res) |>  
+        modeltime::modeltime_calibrate(new_data    = m_test) |> 
+        modeltime::modeltime_forecast (new_data    = m_test,
+                                      actual_data  = futuretbl_modl_res) |> 
+          dplyr::filter(.key == "prediction"),
+                error = function(e) return(NULL)) 
+      
+      tryCatch(xxx_glmnet <-  modeltime::modeltime_table(wk_glmnet) |>  
+        modeltime::modeltime_calibrate(new_data    = m_test) |> 
+        modeltime::modeltime_forecast (new_data    = m_test,
+                                      actual_data  = futuretbl_modl_res) |> 
+          dplyr::filter(.key == "prediction"),
+                error = function(e) return(NULL)) 
+      
+      
+    tryCatch(xxx_cubist <-  modeltime::modeltime_table(wk_cubist) |>  
+        modeltime::modeltime_calibrate(new_data    = m_test) |> 
+        modeltime::modeltime_forecast (new_data    = m_test,
+                                      actual_data  = futuretbl_modl_res) |> 
+          dplyr::filter(.key == "prediction"),
+                error = function(e) return(NULL)) 
+      
+      
+       tryCatch(xxx_mars <-  modeltime::modeltime_table(wk_earth) |>  
+        modeltime::modeltime_calibrate(new_data    = m_test) |> 
+        modeltime::modeltime_forecast (new_data    = m_test,
+                                      actual_data  = futuretbl_modl_res) |> 
+          dplyr::filter(.key == "prediction"),
+                error = function(e) return(NULL)) 
+      
+      tryCatch(xxx_rf <-  modeltime::modeltime_table(wk_rf) |>  
+        modeltime::modeltime_calibrate(new_data    = m_test) |> 
+        modeltime::modeltime_forecast (new_data    = m_test,
+                                      actual_data  = futuretbl_modl_res) |> 
+          dplyr::filter(.key == "prediction"),
+                error = function(e) return(NULL)) 
+    
+   # ------------------------ Error metrics on the test set -------------------
+                        
+      tryCatch(
+        acc <- modeltime::modeltime_table(wk_ar),
+        error = function(e) return(NULL)
+      )
+
+      tryCatch(
+        acc_ <- acc |> 
+          modeltime::modeltime_calibrate(new_data = futuretbl_modl) |> 
+          modeltime::modeltime_forecast(new_data = futuretbl_modl, actual_data = futuretbl_modl) |> 
+          
+          ## Adicionando as predições dos erros
+          
+          dplyr::left_join(
+            xxx |> 
+              dplyr::select(.key, .index, .value) |> 
+              dplyr::rename(svm = .value),
+            by = c(".key", ".index")
+          ) |> 
+          dplyr::left_join(
+            xxx_glmnet |> 
+              dplyr::select(.key, .index, .value) |> 
+              dplyr::rename(glm = .value),
+            by = c(".key", ".index")
+          ) |> 
+          dplyr::left_join(
+            xxx_cubist |> 
+              dplyr::select(.key, .index, .value) |> 
+              dplyr::rename(cubist = .value),
+            by = c(".key", ".index")
+          ) |> 
+          dplyr::left_join(
+            xxx_mars |> 
+              dplyr::select(.key, .index, .value) |> 
+              dplyr::rename(mars = .value),
+            by = c(".key", ".index")
+          ) |> 
+          dplyr::left_join(
+            xxx_rf |> 
+              dplyr::select(.key, .index, .value) |> 
+              dplyr::rename(rf = .value),
+            by = c(".key", ".index")
+          ) |> 
+          
+          ## somando as predições dos erros 
+          
+          dplyr::mutate(
+            .value_svm = .value + svm,
+            .value_glmnet = .value + glm,
+            .value_cubist = .value + cubist,
+            .value_mars = .value + mars,
+            .value_rf = .value + rf
+          ),
+        error = function(e) return(NULL)
+      )
+      
+      # ---------------- error vectors ----------------------------------
+      
+      tryCatch(
+        acc_arima_errors <- acc_ |> 
+          dplyr::select(.index, .value_svm) |> 
+          dplyr::filter(!is.na(.value_svm)) |> 
+          dplyr::rename(.value = .value_svm) |> 
+          dplyr::mutate("model" = "arima_svm") |> 
+          dplyr::filter_all(function(z) !is.na(z)) |> 
+          dplyr::left_join(
+            futuretbl_modl |> 
+              dplyr::select(Date, fy),
+            by = c(".index" = "Date")
+          ) |> 
+          
+          ## calculando as métricas de erro.
+          
+          dplyr::mutate(
+            mae   = yardstick::mae_vec(fy, .value),
+            rmse  = yardstick::rmse_vec(fy, .value),
+            smape = yardstick::smape_vec(.value, fy),
+            mase  = yardstick::mase_vec(fy, .value)
+          ) |> 
+          dplyr::bind_rows(
+            acc_ |> 
+              dplyr::select(.index, .value_glmnet) |> 
+              dplyr::filter(!is.na(.value_glmnet)) |> 
+              dplyr::rename(.value = .value_glmnet) |> 
+              dplyr::mutate("model" = "arima_glmnet") |>
+              dplyr::filter_all(function(z) !is.na(z)) |> 
+              dplyr::left_join(
+                futuretbl_modl |> 
+                  dplyr::select(Date, fy),
+                by = c(".index" = "Date")
+              ) |> 
+              dplyr::mutate(
+                mae   = yardstick::mae_vec(fy, .value),
+                rmse  = yardstick::rmse_vec(fy, .value),
+                smape = yardstick::smape_vec(.value, fy),
+                mase  = yardstick::mase_vec(fy, .value)
+              )
+          ) |> 
+          dplyr::bind_rows(
+            acc_ |> 
+              dplyr::select(.index, .value_cubist) |> 
+              dplyr::filter(!is.na(.value_cubist)) |> 
+              dplyr::rename(.value = .value_cubist) |> 
+              dplyr::mutate("model" = "arima_cubist") |>
+              dplyr::filter_all(function(z) !is.na(z)) |> 
+              dplyr::left_join(
+                futuretbl_modl |> 
+                  dplyr::select(Date, fy),
+                by = c(".index" = "Date")
+              ) |> 
+              dplyr::mutate(
+                mae   = yardstick::mae_vec(fy, .value),
+                rmse  = yardstick::rmse_vec(fy, .value),
+                smape = yardstick::smape_vec(.value, fy),
+                mase  = yardstick::mase_vec(fy, .value)
+              )
+          ) |> 
+          dplyr::bind_rows(
+            acc_ |> 
+              dplyr::select(.index, .value_mars) |> 
+              dplyr::filter(!is.na(.value_mars)) |> 
+              dplyr::rename(.value = .value_mars) |> 
+              dplyr::mutate("model" = "arima_mars") |>
+              dplyr::filter_all(function(z) !is.na(z)) |> 
+              dplyr::left_join(
+                futuretbl_modl |> 
+                  dplyr::select(Date, fy),
+                by = c(".index" = "Date")
+              ) |> 
+              dplyr::mutate(
+                mae   = yardstick::mae_vec(fy, .value),
+                rmse  = yardstick::rmse_vec(fy, .value),
+                smape = yardstick::smape_vec(.value, fy),
+                mase  = yardstick::mase_vec(fy, .value)
+              )
+          ) |> 
+          dplyr::bind_rows(
+            acc_ |> 
+              dplyr::select(.index, .value_rf) |> 
+              dplyr::filter(!is.na(.value_rf)) |> 
+              dplyr::rename(.value = .value_rf) |> 
+              dplyr::mutate("model" = "arima_rf") |>
+              dplyr::filter_all(function(z) !is.na(z)) |> 
+              dplyr::left_join(
+                futuretbl_modl |> 
+                  dplyr::select(Date, fy),
+                by = c(".index" = "Date")
+              ) |> 
+              dplyr::mutate(
+                mae   = yardstick::mae_vec(fy, .value),
+                rmse  = yardstick::rmse_vec(fy, .value),
+                smape = yardstick::smape_vec(.value, fy),
+                mase  = yardstick::mase_vec(fy, .value)
+              )
+          ),
+        error = function(e) return(NULL)
+      )
+
+   
+      
+        # ------------------------ Final round ---------------------------------
+      # -------------------------- recalibrando no todo e forecast -------------
+       
+       tryCatch(refit <- modeltime::modeltime_table(wk_cubist,wk_earth,wk_rf,wk_svm_res,wk_glmnet) |> 
+                  modeltime::update_model_description(.model_id = 1, "arima_cubist") |>
+                  modeltime::update_model_description(.model_id = 2, "arima_mars") |>
+                  modeltime::update_model_description(.model_id = 3, "arima_rf") |>
+                  modeltime::update_model_description(.model_id = 4, "arima_svm") |>
+                  modeltime::update_model_description(.model_id = 5, "arima_glmnet") |>
+                            
+                # insert whole data here
+                 modeltime::modeltime_refit(data    = futuretbl_modl_res) |> 
+                  modeltime::modeltime_forecast(new_data =futuretbl_res),
+                error = function(e) return(NULL))
+    
+ 
+    tryCatch(refit_ar <- modeltime::modeltime_table(wk_ar) |> 
+                            
+                  modeltime::modeltime_forecast(new_data =futuretbl),
+                error = function(e) return(NULL))
+      
+      
+      # -------------------------- put everything together and sum up ---------------
+      
+      tryCatch(refit <- refit |> 
+                            
+                  dplyr::left_join(refit_ar, by = ".index") |> 
+                 dplyr::mutate(.value = .value.x + .value.y) |> 
+                 dplyr::left_join(acc_arima_errors |> 
+                                    dplyr::select(-fy,-.index,-.value) |> 
+                                    dplyr::distinct_all(), by = c(".model_desc.x" = "model")),
+                error = function(e) return(NULL))
+      
+    # ------------------------------------ end --------------------------------
+               
+       tryCatch(refit <- refit |>  
+                        dplyr::mutate(PN= m$PN[1])|>
+                      dplyr::select(.model_desc.x,.index,.value,mae,rmse,smape,mase,PN),
+                error = function(e) return(NULL))
+    
+         tryCatch(refit ,
+                error = function(e) return(NULL))
+   #}))              
